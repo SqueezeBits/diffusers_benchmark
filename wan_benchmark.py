@@ -88,7 +88,7 @@ class TimingResult:
     label: str
     e2e_ms: float
     warmup_ms: float = 0.0
-    components: dict[str, float] = field(default_factory=dict)
+    components: dict[str, tuple[int, float]] = field(default_factory=dict)
 
 
 class StageTimer:
@@ -117,8 +117,9 @@ class StageTimer:
 
         return _ctx()
 
-    def summary(self) -> dict[str, float]:
-        return {k: sum(v) for k, v in self.samples.items()}
+    def summary(self) -> dict[str, tuple[int, float]]:
+        """Returns {name: (calls, total_ms)}."""
+        return {k: (len(v), sum(v)) for k, v in self.samples.items()}
 
 
 def load_i2v_image(height: int, width: int) -> Image.Image:
@@ -177,8 +178,11 @@ def run_benchmark(
         pipe.transformer = torch.compile(
             pipe.transformer, mode="max-autotune-no-cudagraphs", dynamic=True
         )
-        pipe.vae = torch.compile(
-            pipe.vae, mode=compile_mode, dynamic=True
+        pipe.vae.encode = torch.compile(
+            pipe.vae.encode, mode=compile_mode, dynamic=True
+        )
+        pipe.vae.decode = torch.compile(
+            pipe.vae.decode, mode=compile_mode, dynamic=True
         )
         pipe.text_encoder = torch.compile(
             pipe.text_encoder, dynamic=True
@@ -293,8 +297,8 @@ def run_benchmark(
                 "(%d/%d) %s — E2E %.0fms (warmup %.0fms) → %s",
                 idx, total, tag, e2e_ms, warmup_ms, video_path,
             )
-            for comp, ms in sorted(components.items()):
-                log.info("  %s: %.0fms", comp, ms)
+            for comp, (calls, ms) in sorted(components.items()):
+                log.info("  %s: %.0fms (%d calls, %.1fms avg)", comp, ms, calls, ms / calls if calls else 0)
             results.append(
                 TimingResult(model_name, label, e2e_ms, warmup_ms, components)
             )
@@ -317,37 +321,58 @@ def print_summary(results: list[TimingResult], steps: int) -> None:
     except Exception:
         gpu = "unknown"
 
-    print(f"\n{'=' * 65}")
-    print(f"  Diffusers Wan Benchmark — {gpu}")
-    print(f"  {steps} steps, torch.compile (max-autotune, dynamic=True)")
-    print(f"{'=' * 65}\n")
-
-    hdr = f"{'Model':<22} {'Resolution':<12} {'E2E (ms)':>10} {'Warmup':>10}"
-    print(hdr)
-    print("-" * len(hdr))
-
     model_names = list(dict.fromkeys(r.model for r in results))
+
     for model_name in model_names:
         model_results = [r for r in results if r.model == model_name]
         for r in model_results:
-            print(f"{r.model:<22} {r.label:<12} {r.e2e_ms:>10.0f} {r.warmup_ms:>10.0f}")
+            # Collect all component names across results
+            comp_names = sorted(
+                {k for mr in model_results for k in mr.components}
+            )
+
+            print(f"\n==================== PROFILING REPORT ==")
+            print(f"  {gpu} | {model_name} | {r.label} | {steps} steps")
+            print(f"  torch.compile (max-autotune-no-cudagraphs, dynamic=True)")
+
+            # Component timings (calls from timer samples)
+            print(f"\nComponent Timings:")
+            hdr = f"{'components':<30} {'calls':>7} {'total':>12} {'avg':>12} (ms)"
+            print(hdr)
+            for comp in comp_names:
+                calls, ms = r.components.get(comp, (0, 0))
+                avg = ms / calls if calls else 0
+                print(f"{comp:<30} {calls:>7} {ms:>12.3f} {avg:>12.3f}")
+
+            # Method timings
+            print(f"\nMethod Timings:")
+            hdr = f"{'methods':<30} {'calls':>7} {'total':>12} {'avg':>12} (ms)"
+            print(hdr)
+            print(f"{'E2E execute':<30} {'1':>7} {r.e2e_ms:>12.3f} {r.e2e_ms:>12.3f}")
+            for comp in comp_names:
+                calls, ms = r.components.get(comp, (0, 0))
+                avg = ms / calls if calls else 0
+                print(f"{comp:<30} {calls:>7} {ms:>12.3f} {avg:>12.3f}")
+            print(f"{'warmup':<30} {'1':>7} {r.warmup_ms:>12.3f} {r.warmup_ms:>12.3f}")
+            print(f"==========================================")
+
+    # Summary table
+    print(f"\n{'=' * 65}")
+    print(f"  Summary — {gpu}, {steps} steps")
+    print(f"{'=' * 65}\n")
+
+    hdr = f"{'Model':<22} {'Resolution':<12} {'E2E (ms)':>10}"
+    print(hdr)
+    print("-" * len(hdr))
+
+    for model_name in model_names:
+        model_results = [r for r in results if r.model == model_name]
+        for r in model_results:
+            print(f"{r.model:<22} {r.label:<12} {r.e2e_ms:>10.0f}")
         if len(model_results) > 1:
             avg = mean(r.e2e_ms for r in model_results)
             print(f"{model_name:<22} {'avg':<12} {avg:>10.0f}")
         print()
-
-    # Component breakdown
-    print(f"{'=' * 65}")
-    print("  Component Breakdown (ms)")
-    print(f"{'=' * 65}\n")
-    for model_name in model_names:
-        model_results = [r for r in results if r.model == model_name]
-        for r in model_results:
-            if r.components:
-                print(f"  {r.model} / {r.label}:")
-                for comp, ms in sorted(r.components.items()):
-                    print(f"    {comp:<25} {ms:>10.0f}")
-                print()
 
     # Save JSON
     json_data = [asdict(r) for r in results]
