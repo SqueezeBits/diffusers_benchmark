@@ -1,0 +1,23 @@
+[project]
+name = "diffusers-benchmark"
+version = "0.1.0"
+description = "Stage-level benchmark script for FLUX pipelines in Hugging Face diffusers."
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "accelerate>=1.0.0",
+    "diffusers>=0.37.1",
+    "numpy>=2.0.0",
+    "Pillow>=10.4.0",
+    "safetensors>=0.4.0",
+    "sentencepiece>=0.2.0",
+    "transformers>=5.4.0",
+]
+
+[project.optional-dependencies]
+torch = [
+    "torch>=2.11.0",
+]
+
+[tool.uv]
+package = false
