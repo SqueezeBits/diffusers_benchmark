@@ -35,7 +35,7 @@ Model support is inferred from the model ID string. If the ID does not contain `
 - Linux
 - One NVIDIA GPU
 - CUDA 13.0 or newer
-- Python 3.12 or 3.13
+- Python 3.12
 - Hugging Face access permission and login token if you want to use gated models such as `black-forest-labs/FLUX.2-dev`
 
 ## Dependency Management With `uv`
@@ -47,7 +47,7 @@ Because this project is intended to run only on CUDA 13.0+ environments, `torch`
 Create the environment and install dependencies with:
 
 ```bash
-uv venv --python 3.13
+uv venv --python 3.12
 source .venv/bin/activate
 uv sync
 ```
