@@ -173,11 +173,17 @@ def run_benchmark(
         pipe.to("cuda")
 
         log.info("torch.compile (dynamic=True)...")
-        # Transformer uses no-cudagraphs to avoid CUDAGraph overwrite
-        # errors from CFG (unconditional + conditional forward)
-        pipe.transformer = torch.compile(
-            pipe.transformer, mode="max-autotune-no-cudagraphs", dynamic=True
-        )
+        # Compile transformer block-by-block (like MAX) for fair comparison
+        # Use no-cudagraphs to avoid CUDAGraph overwrite errors with CFG
+        if compile_mode == "layer-wise":
+            for i, block in enumerate(pipe.transformer.blocks):
+                pipe.transformer.blocks[i] = torch.compile(
+                    block, mode="max-autotune-no-cudagraphs", dynamic=True
+                )
+        else:
+            pipe.transformer = torch.compile(
+                pipe.transformer, mode="max-autotune-no-cudagraphs", dynamic=True
+            )
         pipe.vae.encode = torch.compile(
             pipe.vae.encode, mode=compile_mode, dynamic=True
         )
