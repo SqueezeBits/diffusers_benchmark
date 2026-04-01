@@ -2,13 +2,12 @@
 from __future__ import annotations
 
 import argparse
-import inspect
 import json
-import sys
+import inspect
 import time
 from collections import defaultdict
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from statistics import mean
 from typing import Any
@@ -18,9 +17,6 @@ import torch
 from PIL import Image
 
 from diffusers import Flux2KleinPipeline, Flux2Pipeline, FluxImg2ImgPipeline, FluxPipeline
-
-
-STAGE_NAMES = ("prompt_embedding", "vae_encode", "denoising_step", "decode_latent")
 
 
 @dataclass
@@ -137,12 +133,11 @@ def load_pipeline(
     device: torch.device,
 ):
     family = infer_model_family(model_id)
-    if family == "flux1":
-        pipeline_cls = FluxPipeline if mode == "t2i" else FluxImg2ImgPipeline
-    elif family == "flux2":
-        pipeline_cls = Flux2Pipeline
-    else:
-        pipeline_cls = Flux2KleinPipeline
+    pipeline_cls = {
+        "flux1": FluxPipeline if mode == "t2i" else FluxImg2ImgPipeline,
+        "flux2": Flux2Pipeline,
+        "flux2_klein": Flux2KleinPipeline,
+    }[family]
 
     pipe = pipeline_cls.from_pretrained(model_id, torch_dtype=torch.bfloat16)
     pipe.to(device=device, dtype=torch.bfloat16)
@@ -151,18 +146,9 @@ def load_pipeline(
     return pipe
 
 
-
-def load_input_image(path: str | None, width: int, height: int) -> Image.Image:
-    if path is None:
-        raise ValueError("Input image path is required for image-to-image mode.")
+def load_input_image(path: str, width: int, height: int) -> Image.Image:
     image = Image.open(path).convert("RGB")
     return image.resize((width, height))
-
-
-def maybe_compile(fn: Any, enabled: bool, mode: str) -> Any:
-    if not enabled:
-        return fn
-    return torch.compile(fn, mode=mode, fullgraph=False)
 
 
 def apply_compile(
@@ -173,23 +159,26 @@ def apply_compile(
     if not enabled:
         return
 
+    def compile_method(fn: Any) -> Any:
+        return torch.compile(fn, mode=compile_mode, fullgraph=False)
+
     for attr_name in ("text_encoder", "text_encoder_2"):
         module = getattr(pipe, attr_name, None)
         if module is not None:
             print(f"Compiling {attr_name}...")
-            module.forward = maybe_compile(module.forward, True, compile_mode)
+            module.forward = compile_method(module.forward)
 
     if getattr(pipe, "transformer", None) is not None:
-        print(f"Compiling transformer...")
-        pipe.transformer.forward = maybe_compile(pipe.transformer.forward, True, compile_mode)
+        print("Compiling transformer...")
+        pipe.transformer.forward = compile_method(pipe.transformer.forward)
 
     if getattr(pipe, "vae", None) is not None:
         if hasattr(pipe.vae, "encode"):
-            print(f"Compiling vae.encode...")
-            pipe.vae.encode = maybe_compile(pipe.vae.encode, True, compile_mode)
+            print("Compiling vae.encode...")
+            pipe.vae.encode = compile_method(pipe.vae.encode)
         if hasattr(pipe.vae, "decode"):
-            print(f"Compiling vae.decode...")
-            pipe.vae.decode = maybe_compile(pipe.vae.decode, True, compile_mode)
+            print("Compiling vae.decode...")
+            pipe.vae.decode = compile_method(pipe.vae.decode)
 
 
 @contextmanager
@@ -281,13 +270,15 @@ def make_generator(device: torch.device, seed: int) -> torch.Generator:
 def collect_iteration_metrics(stage_timer: StageTimer, total_ms: float) -> IterationMetrics:
     prompt_embedding_ms = sum(stage_timer.samples.get("prompt_embedding", []))
     vae_encode_samples = stage_timer.samples.get("vae_encode", [])
+    denoising_samples = stage_timer.samples.get("denoising_step", [])
+    decode_latent_ms = sum(stage_timer.samples.get("decode_latent", []))
+
     vae_encode_ms = sum(vae_encode_samples)
     vae_encode_calls = len(vae_encode_samples)
-    denoising_samples = stage_timer.samples.get("denoising_step", [])
     denoising_total_ms = sum(denoising_samples)
     denoising_calls = len(denoising_samples)
     denoising_step_ms = denoising_total_ms / denoising_calls if denoising_calls else 0.0
-    decode_latent_ms = sum(stage_timer.samples.get("decode_latent", []))
+
     return IterationMetrics(
         total_ms=total_ms,
         prompt_embedding_ms=prompt_embedding_ms,
@@ -300,7 +291,13 @@ def collect_iteration_metrics(stage_timer: StageTimer, total_ms: float) -> Itera
     )
 
 
-def save_output_image(output: Any, path: str) -> None:
+def ensure_parent_dir(path: str) -> Path:
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    return output_path
+
+
+def extract_first_image(output: Any) -> Image.Image | np.ndarray:
     image = output
     if isinstance(image, tuple):
         image = image[0]
@@ -308,9 +305,12 @@ def save_output_image(output: Any, path: str) -> None:
         if not image:
             raise ValueError("Pipeline returned an empty image list.")
         image = image[0]
+    return image
 
-    output_path = Path(path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+def save_output_image(output: Any, path: str) -> None:
+    image = extract_first_image(output)
+    output_path = ensure_parent_dir(path)
 
     if isinstance(image, Image.Image):
         image.save(output_path)
@@ -410,10 +410,9 @@ def save_results(path: str, args: argparse.Namespace, pipe: Any, results: list[I
             ),
             "decode_latent_ms": summarize([result.decode_latent_ms for result in results]),
         },
-        "iterations": [result.__dict__ for result in results],
+        "iterations": [asdict(result) for result in results],
     }
-    output_path = Path(path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path = ensure_parent_dir(path)
     output_path.write_text(json.dumps(payload, indent=2) + "\n")
 
 
