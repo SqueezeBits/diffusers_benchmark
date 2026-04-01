@@ -88,6 +88,37 @@ class TimingResult:
     label: str
     e2e_ms: float
     warmup_ms: float = 0.0
+    components: dict[str, float] = field(default_factory=dict)
+
+
+class StageTimer:
+    """Measures per-component timings with CUDA synchronization."""
+
+    def __init__(self) -> None:
+        self.samples: dict[str, list[float]] = {}
+
+    def reset(self) -> None:
+        self.samples.clear()
+
+    def measure(self, name: str):
+        import contextlib
+
+        @contextlib.contextmanager
+        def _ctx():
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            try:
+                yield
+            finally:
+                torch.cuda.synchronize()
+                self.samples.setdefault(name, []).append(
+                    (time.perf_counter() - t0) * 1000
+                )
+
+        return _ctx()
+
+    def summary(self) -> dict[str, float]:
+        return {k: sum(v) for k, v in self.samples.items()}
 
 
 def load_i2v_image(height: int, width: int) -> Image.Image:
@@ -140,9 +171,11 @@ def run_benchmark(
         )
         pipe.to("cuda")
 
-        log.info("torch.compile (mode=%s, dynamic=True)...", compile_mode)
+        log.info("torch.compile (dynamic=True)...")
+        # Transformer uses no-cudagraphs to avoid CUDAGraph overwrite
+        # errors from CFG (unconditional + conditional forward)
         pipe.transformer = torch.compile(
-            pipe.transformer, mode=compile_mode, dynamic=True
+            pipe.transformer, mode="max-autotune-no-cudagraphs", dynamic=True
         )
         pipe.vae = torch.compile(
             pipe.vae, mode=compile_mode, dynamic=True
@@ -150,6 +183,62 @@ def run_benchmark(
         pipe.text_encoder = torch.compile(
             pipe.text_encoder, dynamic=True
         )
+
+        # Instrument pipeline for component-level timing
+        timer = StageTimer()
+        _orig_encode_prompt = pipe.encode_prompt
+        _orig_transformer_fwd = pipe.transformer.forward
+        _orig_vae_decode = pipe.vae.decode
+        _orig_vae_encode = getattr(pipe.vae, "encode", None)
+
+        def _timed_encode_prompt(*a, **kw):
+            with timer.measure("text_encoder"):
+                return _orig_encode_prompt(*a, **kw)
+
+        def _timed_transformer(*a, **kw):
+            with timer.measure("transformer"):
+                return _orig_transformer_fwd(*a, **kw)
+
+        def _timed_vae_decode(*a, **kw):
+            with timer.measure("vae_decode"):
+                return _orig_vae_decode(*a, **kw)
+
+        def _timed_vae_encode(*a, **kw):
+            with timer.measure("vae_encode"):
+                return _orig_vae_encode(*a, **kw)
+
+        pipe.encode_prompt = _timed_encode_prompt
+        pipe.transformer.forward = _timed_transformer
+        pipe.vae.decode = _timed_vae_decode
+        if _orig_vae_encode is not None:
+            pipe.vae.encode = _timed_vae_encode
+
+        # Warmup with small resolution to trigger torch.compile
+        log.info("Warmup (480x832, 17 frames, 2 steps)...")
+        warmup_kwargs: dict = {
+            "prompt": prompt,
+            "negative_prompt": "low quality",
+            "height": 480,
+            "width": 832,
+            "num_frames": 17,
+            "guidance_scale": cfg["guidance"],
+            "num_inference_steps": 2,
+        }
+        if cfg["guidance_2"] is not None:
+            warmup_kwargs["guidance_scale_2"] = cfg["guidance_2"]
+        if cfg["mode"] == "i2v":
+            warmup_kwargs["image"] = load_i2v_image(480, 832)
+
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        _ = pipe(**warmup_kwargs).frames[0]
+        torch.cuda.synchronize()
+        warmup_ms = (time.perf_counter() - t0) * 1000
+        log.info("Warmup done: %.0fms", warmup_ms)
+
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
         for res in RESOLUTIONS:
             idx += 1
@@ -173,38 +262,42 @@ def run_benchmark(
             if cfg["mode"] == "i2v":
                 pipe_kwargs["image"] = load_i2v_image(height, width)
 
-            # Warmup
-            log.info("(%d/%d) %s — warmup", idx, total, tag)
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
-            _ = pipe(**pipe_kwargs).frames[0]
-            torch.cuda.synchronize()
-            warmup_ms = (time.perf_counter() - t0) * 1000
-            log.info("(%d/%d) %s — warmup %.0fms", idx, total, tag, warmup_ms)
-
-            gc.collect()
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-
             # Timed run
             log.info("(%d/%d) %s — timed run", idx, total, tag)
+            timer.reset()
             torch.cuda.synchronize()
             t0 = time.perf_counter()
             pipe_kwargs["output_type"] = "np"
             output = pipe(**pipe_kwargs).frames[0]
             torch.cuda.synchronize()
             e2e_ms = (time.perf_counter() - t0) * 1000
+            components = timer.summary()
 
-            # Save video
+            # Save video (h264 via av for compatibility)
             video_path = output_dir / f"{model_name}_{label}.mp4"
-            from diffusers.utils import export_to_video
+            import av
 
-            export_to_video(output, str(video_path), fps=16)
+            with av.open(str(video_path), mode="w") as container:
+                stream = container.add_stream("h264", rate=16)
+                stream.width = width
+                stream.height = height
+                stream.pix_fmt = "yuv420p"
+                for frame_np in output:
+                    frame_u8 = (np.clip(frame_np, 0, 1) * 255).astype(np.uint8)
+                    frame = av.VideoFrame.from_ndarray(frame_u8, format="rgb24")
+                    for packet in stream.encode(frame):
+                        container.mux(packet)
+                for packet in stream.encode():
+                    container.mux(packet)
             log.info(
                 "(%d/%d) %s — E2E %.0fms (warmup %.0fms) → %s",
                 idx, total, tag, e2e_ms, warmup_ms, video_path,
             )
-            results.append(TimingResult(model_name, label, e2e_ms, warmup_ms))
+            for comp, ms in sorted(components.items()):
+                log.info("  %s: %.0fms", comp, ms)
+            results.append(
+                TimingResult(model_name, label, e2e_ms, warmup_ms, components)
+            )
 
         del pipe
         gc.collect()
@@ -242,6 +335,19 @@ def print_summary(results: list[TimingResult], steps: int) -> None:
             avg = mean(r.e2e_ms for r in model_results)
             print(f"{model_name:<22} {'avg':<12} {avg:>10.0f}")
         print()
+
+    # Component breakdown
+    print(f"{'=' * 65}")
+    print("  Component Breakdown (ms)")
+    print(f"{'=' * 65}\n")
+    for model_name in model_names:
+        model_results = [r for r in results if r.model == model_name]
+        for r in model_results:
+            if r.components:
+                print(f"  {r.model} / {r.label}:")
+                for comp, ms in sorted(r.components.items()):
+                    print(f"    {comp:<25} {ms:>10.0f}")
+                print()
 
     # Save JSON
     json_data = [asdict(r) for r in results]
