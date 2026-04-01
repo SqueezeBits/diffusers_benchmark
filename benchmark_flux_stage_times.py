@@ -412,7 +412,9 @@ def save_results(path: str, args: argparse.Namespace, pipe: Any, results: list[I
         },
         "iterations": [result.__dict__ for result in results],
     }
-    Path(path).write_text(json.dumps(payload, indent=2) + "\n")
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(payload, indent=2) + "\n")
 
 
 def main() -> None:
