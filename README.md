@@ -29,11 +29,6 @@ The script currently supports the following FLUX model families based on the Hug
 
 Model support is inferred from the model ID string. If the ID does not contain `flux.1`, `flux.2`, or `flux.2-klein`, the script will reject it as unsupported.
 
-## Repository Layout
-
-- `benchmark.py`: main benchmark script
-- `pyproject.toml`: dependency definition for `uv`
-- `.gitignore`: ignore rules for virtual environments and generated outputs
 
 ## Requirements
 
@@ -63,15 +58,6 @@ If you already have an active environment and only want to add the project depen
 uv sync --active
 ```
 
-## Hugging Face Login
-
-If you use a gated model, you may need to log in to Hugging Face first.
-
-```bash
-huggingface-cli login
-```
-
-You can also use the `HF_TOKEN` environment variable.
 
 ## Usage
 
