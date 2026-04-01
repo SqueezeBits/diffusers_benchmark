@@ -241,6 +241,7 @@ def apply_compile(
     if not enabled:
         pipe._benchmark_transformer_compile_enabled = False
         pipe._benchmark_transformer_compile_skipped_reason = "compile disabled by flag"
+        pipe._benchmark_transformer_compile_strategy = None
         return
 
     def compile_method(fn: Any) -> Any:
@@ -256,18 +257,22 @@ def apply_compile(
     fp8_replacements = int(getattr(pipe, "_benchmark_fp8_linear_replacements", 0))
     if transformer is not None:
         if fp8_replacements > 0:
-            reason = (
-                "skipped for fp8 DiT because torch.compile/Inductor currently fails "
-                "lowering torch._scaled_mm in this environment"
+            print("Compiling transformer module for fp8 denoising...")
+            pipe.transformer = torch.compile(
+                transformer,
+                mode="reduce-overhead",
+                fullgraph=False,
+                dynamic=True,
             )
-            print(f"Skipping transformer compile: {reason}.")
-            pipe._benchmark_transformer_compile_enabled = False
-            pipe._benchmark_transformer_compile_skipped_reason = reason
+            pipe._benchmark_transformer_compile_enabled = True
+            pipe._benchmark_transformer_compile_skipped_reason = None
+            pipe._benchmark_transformer_compile_strategy = "module_reduce_overhead_dynamic"
         else:
             print("Compiling transformer...")
             transformer.forward = compile_method(transformer.forward)
             pipe._benchmark_transformer_compile_enabled = True
             pipe._benchmark_transformer_compile_skipped_reason = None
+            pipe._benchmark_transformer_compile_strategy = "forward_max_autotune"
 
     if getattr(pipe, "vae", None) is not None:
         if hasattr(pipe.vae, "encode"):
@@ -505,6 +510,9 @@ def save_results(path: str, args: argparse.Namespace, pipe: Any, results: list[I
             ),
             "transformer_compile_skipped_reason": getattr(
                 pipe, "_benchmark_transformer_compile_skipped_reason", None
+            ),
+            "transformer_compile_strategy": getattr(
+                pipe, "_benchmark_transformer_compile_strategy", None
             ),
             "fp8_linear_replacements": getattr(
                 pipe, "_benchmark_fp8_linear_replacements", 0
