@@ -26,8 +26,11 @@ The script currently supports the following FLUX model families based on the Hug
 | `FLUX.2*` | `i2i` | `Flux2Pipeline` | `black-forest-labs/FLUX.2-dev` |
 | `FLUX.2-Klein*` | `t2i` | `Flux2KleinPipeline` | `black-forest-labs/FLUX.2-Klein` |
 | `FLUX.2-Klein*` | `i2i` | `Flux2KleinPipeline` | `black-forest-labs/FLUX.2-Klein` |
+| `FLUX.2-klein*fp8*` | `t2i` | `Flux2KleinPipeline` + fp8 DiT patch | `black-forest-labs/FLUX.2-klein-4b-fp8` |
+| `FLUX.2-klein*fp8*` | `i2i` | `Flux2KleinPipeline` + fp8 DiT patch | `black-forest-labs/FLUX.2-klein-4b-fp8` |
 
 Model support is inferred from the model ID string. If the ID does not contain `flux.1`, `flux.2`, or `flux.2-klein`, the script will reject it as unsupported.
+For `FLUX.2-klein` fp8 checkpoints, the benchmark loads the matching bf16 base pipeline first, then swaps only the DiT linear layers to fp8. The text encoder and VAE remain bf16.
 
 
 ## Requirements
@@ -48,6 +51,14 @@ Create the environment and install dependencies with:
 
 ```bash
 uv venv --python 3.13
+source .venv/bin/activate
+uv sync
+```
+
+If you see a `torch` import failure on Python 3.13 in your environment, recreate the venv with Python 3.12 instead:
+
+```bash
+uv venv --python 3.12
 source .venv/bin/activate
 uv sync
 ```
@@ -92,9 +103,26 @@ uv run python benchmark.py \
   --save-json outputs/i2i-bench.json
 ```
 
+### FLUX.2-klein fp8 benchmark
+
+```bash
+uv run python benchmark.py \
+  --model "black-forest-labs/FLUX.2-klein-4b-fp8" \
+  --mode t2i \
+  --prompt "A cat in a garden" \
+  --num-inference-steps 28 \
+  --warmup 1 \
+  --iterations 5 \
+  --output outputs/flux2-klein-fp8-output.png \
+  --save-json outputs/flux2-klein-fp8-bench.json
+```
+
+The official `FLUX.2-klein-4b-fp8` repo contains only DiT weights, so the benchmark automatically uses `black-forest-labs/FLUX.2-klein-4B` as the bf16 base pipeline. If you use a different DiT-only fp8 repo, pass the matching full pipeline with `--base-model`.
+
 ## Main Options
 
 - `--model`: Hugging Face model ID
+- `--base-model`: full pipeline model ID used when `--model` is a DiT-only checkpoint
 - `--mode`: `t2i` or `i2i`
 - `--prompt`: input prompt
 - `--image`: input image used in `i2i` mode

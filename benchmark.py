@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import inspect
 import time
@@ -17,6 +18,18 @@ import torch
 from PIL import Image
 
 from diffusers import Flux2KleinPipeline, Flux2Pipeline, FluxImg2ImgPipeline, FluxPipeline
+from fp8_utils import download_fp8_weights, replace_dit_linear_with_fp8
+
+KLEIN_BF16_REPO = "black-forest-labs/FLUX.2-klein-4B"
+KLEIN_FP8_REPO = "black-forest-labs/FLUX.2-klein-4b-fp8"
+
+
+@dataclass(frozen=True)
+class PipelineLoadSpec:
+    pipeline_model_id: str
+    transformer_weights_model_id: str | None
+    move_dtype: torch.dtype | None
+    precision_mode: str
 
 
 @dataclass
@@ -84,6 +97,13 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--model", required=True, help="Hugging Face model id.")
+    parser.add_argument(
+        "--base-model",
+        help=(
+            "Optional full pipeline model id used when --model points to a DiT-only "
+            "checkpoint such as FLUX.2-klein fp8."
+        ),
+    )
     parser.add_argument("--mode", choices=("t2i", "i2i"), default="t2i", help="Benchmark mode.")
     parser.add_argument("--prompt", default="A cat in a garden", help="Prompt text.")
     parser.add_argument("--image", help="Init image path for i2i mode.")
@@ -127,22 +147,84 @@ def infer_model_family(model_id: str) -> str:
     raise ValueError(f"Unsupported model family for: {model_id}")
 
 
+def resolve_load_spec(model_id: str, base_model: str | None) -> PipelineLoadSpec:
+    model_id_lower = model_id.lower()
+    if "flux.2-klein" in model_id_lower and "fp8" in model_id_lower:
+        pipeline_model_id = base_model
+        if pipeline_model_id is None and model_id_lower == KLEIN_FP8_REPO.lower():
+            pipeline_model_id = KLEIN_BF16_REPO
+        if pipeline_model_id is None:
+            raise ValueError(
+                "This looks like a DiT-only FLUX.2-klein fp8 checkpoint. "
+                "Pass --base-model with the matching bf16 pipeline repo."
+            )
+        return PipelineLoadSpec(
+            pipeline_model_id=pipeline_model_id,
+            transformer_weights_model_id=model_id,
+            move_dtype=None,
+            precision_mode="mixed_bf16_fp8_dit",
+        )
+
+    return PipelineLoadSpec(
+        pipeline_model_id=model_id,
+        transformer_weights_model_id=None,
+        move_dtype=torch.bfloat16,
+        precision_mode="bf16",
+    )
+
+
 def load_pipeline(
     model_id: str,
+    base_model: str | None,
     mode: str,
     device: torch.device,
 ):
     family = infer_model_family(model_id)
+    load_spec = resolve_load_spec(model_id=model_id, base_model=base_model)
     pipeline_cls = {
         "flux1": FluxPipeline if mode == "t2i" else FluxImg2ImgPipeline,
         "flux2": Flux2Pipeline,
         "flux2_klein": Flux2KleinPipeline,
     }[family]
 
-    pipe = pipeline_cls.from_pretrained(model_id, torch_dtype=torch.bfloat16)
-    pipe.to(device=device, dtype=torch.bfloat16)
+    if load_spec.transformer_weights_model_id is not None and family != "flux2_klein":
+        raise ValueError("FP8 DiT patching is currently only supported for FLUX.2-klein.")
+
+    if load_spec.transformer_weights_model_id is not None:
+        print(f"Loading bf16 base pipeline from {load_spec.pipeline_model_id}...")
+    else:
+        print(f"Loading pipeline from {load_spec.pipeline_model_id}...")
+
+    pipe = pipeline_cls.from_pretrained(
+        load_spec.pipeline_model_id,
+        torch_dtype=torch.bfloat16,
+    )
+
+    if load_spec.transformer_weights_model_id is not None:
+        fp8_tensors = download_fp8_weights(load_spec.transformer_weights_model_id)
+        print("Patching DiT linear layers with fp8 weights...")
+        pipe.transformer, num_replaced = replace_dit_linear_with_fp8(
+            pipe.transformer, fp8_tensors
+        )
+        del fp8_tensors
+        gc.collect()
+        if num_replaced == 0:
+            print(
+                "[fp8] WARNING: no transformer linear layers were replaced. "
+                "Inference will still run, but the DiT will remain bf16."
+            )
+        else:
+            print(f"[fp8] Replaced {num_replaced} DiT linear layers")
+        pipe._benchmark_fp8_linear_replacements = num_replaced
+
+    if load_spec.move_dtype is None:
+        pipe.to(device=device)
+    else:
+        pipe.to(device=device, dtype=load_spec.move_dtype)
     pipe.set_progress_bar_config(disable=True)
-    pipe._benchmark_pipeline_dtype = torch.bfloat16
+    pipe._benchmark_pipeline_dtype = load_spec.precision_mode
+    pipe._benchmark_loaded_pipeline_model = load_spec.pipeline_model_id
+    pipe._benchmark_transformer_weights_model = load_spec.transformer_weights_model_id
     return pipe
 
 
@@ -157,6 +239,8 @@ def apply_compile(
     compile_mode: str,
 ) -> None:
     if not enabled:
+        pipe._benchmark_transformer_compile_enabled = False
+        pipe._benchmark_transformer_compile_skipped_reason = "compile disabled by flag"
         return
 
     def compile_method(fn: Any) -> Any:
@@ -168,9 +252,22 @@ def apply_compile(
             print(f"Compiling {attr_name}...")
             module.forward = compile_method(module.forward)
 
-    if getattr(pipe, "transformer", None) is not None:
-        print("Compiling transformer...")
-        pipe.transformer.forward = compile_method(pipe.transformer.forward)
+    transformer = getattr(pipe, "transformer", None)
+    fp8_replacements = int(getattr(pipe, "_benchmark_fp8_linear_replacements", 0))
+    if transformer is not None:
+        if fp8_replacements > 0:
+            reason = (
+                "skipped for fp8 DiT because torch.compile/Inductor currently fails "
+                "lowering torch._scaled_mm in this environment"
+            )
+            print(f"Skipping transformer compile: {reason}.")
+            pipe._benchmark_transformer_compile_enabled = False
+            pipe._benchmark_transformer_compile_skipped_reason = reason
+        else:
+            print("Compiling transformer...")
+            transformer.forward = compile_method(transformer.forward)
+            pipe._benchmark_transformer_compile_enabled = True
+            pipe._benchmark_transformer_compile_skipped_reason = None
 
     if getattr(pipe, "vae", None) is not None:
         if hasattr(pipe.vae, "encode"):
@@ -382,6 +479,13 @@ def save_results(path: str, args: argparse.Namespace, pipe: Any, results: list[I
     payload = {
         "config": {
             "model": args.model,
+            "base_model": args.base_model,
+            "loaded_pipeline_model": getattr(
+                pipe, "_benchmark_loaded_pipeline_model", args.model
+            ),
+            "transformer_weights_model": getattr(
+                pipe, "_benchmark_transformer_weights_model", None
+            ),
             "mode": args.mode,
             "prompt": args.prompt,
             "height": args.height,
@@ -396,6 +500,15 @@ def save_results(path: str, args: argparse.Namespace, pipe: Any, results: list[I
             "compile_enabled": not args.disable_compile,
             "compile_mode": args.compile_mode,
             "fullgraph": False,
+            "transformer_compile_enabled": getattr(
+                pipe, "_benchmark_transformer_compile_enabled", False
+            ),
+            "transformer_compile_skipped_reason": getattr(
+                pipe, "_benchmark_transformer_compile_skipped_reason", None
+            ),
+            "fp8_linear_replacements": getattr(
+                pipe, "_benchmark_fp8_linear_replacements", 0
+            ),
         },
         "aggregate": {
             "total_ms": summarize([result.total_ms for result in results]),
@@ -426,6 +539,7 @@ def main() -> None:
 
     pipe = load_pipeline(
         model_id=args.model,
+        base_model=args.base_model,
         mode=args.mode,
         device=device,
     )
