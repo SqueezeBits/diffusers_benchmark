@@ -3,7 +3,7 @@ name = "diffusers-benchmark"
 version = "0.1.0"
 description = "Stage-level benchmark script for FLUX pipelines in Hugging Face diffusers."
 readme = "README.md"
-requires-python = ">=3.12,<3.13"
+requires-python = ">=3.13,<3.14"
 dependencies = [
     "accelerate>=1.0.0",
     "diffusers==0.37.0",
