@@ -226,6 +226,12 @@ def run_benchmark(
             with timer.measure("vae_encode"):
                 return _orig_vae_encode(*a, **kw)
 
+        _orig_prepare_latents = pipe.prepare_latents
+
+        def _timed_prepare_latents(*a, **kw):
+            with timer.measure("prepare_latents"):
+                return _orig_prepare_latents(*a, **kw)
+
         pipe.encode_prompt = _timed_encode_prompt
         pipe.transformer.forward = _timed_transformer
         if _orig_transformer2_fwd is not None:
@@ -233,6 +239,7 @@ def run_benchmark(
         pipe.vae.decode = _timed_vae_decode
         if _orig_vae_encode is not None:
             pipe.vae.encode = _timed_vae_encode
+        pipe.prepare_latents = _timed_prepare_latents
 
         # Warmup with small resolution to trigger torch.compile
         log.info("Warmup (480x832, 17 frames, 2 steps)...")
