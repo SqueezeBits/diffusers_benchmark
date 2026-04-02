@@ -128,15 +128,14 @@ uv run python benchmark.py \
   --model "Wan-AI/Wan2.2-TI2V-5B-Diffusers" \
   --prompt "Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage." \
   --negative-prompt "low quality, blurry, distorted, deformed, ugly, bad, poor, worst quality" \
-  --compile-dynamic \
-  --height 704 \
+  --height 720 \
   --width 1280 \
-  --num-frames 121 \
-  --num-inference-steps 50 \
+  --num-frames 81 \
+  --num-inference-steps 40 \
   --guidance-scale 5.0 \
   --seed 42 \
   --warmup 3 \
-  --iterations 50 \
+  --iterations 5 \
   --output-fps 24 \
   --output outputs/wan_ti2v_output.mp4 \
   --save-json outputs/wan_ti2v_bench.json
