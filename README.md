@@ -1,6 +1,6 @@
 # diffusers_benchmark
 
-`diffusers_benchmark` is a small benchmark repository for measuring stage-level latency in FLUX pipelines built with Hugging Face `diffusers`.
+`diffusers_benchmark` is a small benchmark repository for measuring stage-level latency in FLUX and Wan pipelines built with Hugging Face `diffusers`.
 
 The current script measures the following stages:
 
@@ -13,10 +13,11 @@ Supported modes:
 
 - `t2i` (text-to-image)
 - `i2i` (image-to-image)
+- `t2v` / `i2v` via Wan model auto-routing
 
 ## Supported Models
 
-The script currently supports the following FLUX model families based on the Hugging Face model ID:
+The script currently supports the following model families based on the Hugging Face model ID:
 
 | Model family pattern | Mode | Diffusers pipeline | Example model ID |
 | --- | --- | --- | --- |
@@ -26,9 +27,10 @@ The script currently supports the following FLUX model families based on the Hug
 | `FLUX.2*` | `i2i` | `Flux2Pipeline` | `black-forest-labs/FLUX.2-dev` |
 | `FLUX.2-Klein*` | `t2i` | `Flux2KleinPipeline` | `black-forest-labs/FLUX.2-Klein` |
 | `FLUX.2-Klein*` | `i2i` | `Flux2KleinPipeline` | `black-forest-labs/FLUX.2-Klein` |
+| `Wan*` with `t2v`, `i2v`, or `ti2v` in the ID | `t2v` or `i2v` | `WanPipeline` or `WanImageToVideoPipeline` | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` |
 | `Wan-Animate*` | `v2v` | `WanAnimatePipeline` | `Wan-AI/Wan2.2-Animate-14B-Diffusers` |
 
-Model support is inferred from the model ID string. If the ID does not contain `flux.1`, `flux.2`, `flux.2-klein`, or both `wan` and `animate`, the script will reject it as unsupported.
+Model support is inferred from the model ID string. For Wan video models, the script uses `WanPipeline` when no `--image` is provided and auto-routes to `WanImageToVideoPipeline` when `--image` is present.
 
 
 ## Requirements
@@ -117,12 +119,36 @@ uv run python benchmark.py \
   --save-json outputs/wan_animate.json
 ```
 
+### Wan TI2V benchmark
+
+`Wan2.2-TI2V-5B-Diffusers` can run as text-to-video without `--image`, matching the MAX example you shared. If you provide `--image`, the script auto-routes to `WanImageToVideoPipeline`.
+
+```bash
+uv run python benchmark.py \
+  --model "Wan-AI/Wan2.2-TI2V-5B-Diffusers" \
+  --prompt "Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage." \
+  --negative-prompt "low quality, blurry, distorted, deformed, ugly, bad, poor, worst quality" \
+  --compile-dynamic \
+  --height 704 \
+  --width 1280 \
+  --num-frames 121 \
+  --num-inference-steps 50 \
+  --guidance-scale 5.0 \
+  --seed 42 \
+  --warmup 3 \
+  --iterations 50 \
+  --output-fps 24 \
+  --output outputs/wan_ti2v_output.mp4 \
+  --save-json outputs/wan_ti2v_bench.json
+```
+
 ## Main Options
 
 - `--model`: Hugging Face model ID
 - `--mode`: `t2i` or `i2i`
 - `--prompt`: input prompt
-- `--image`: input image; required in `i2i` mode and always required for Wan-Animate (character reference)
+- `--negative-prompt`: optional negative prompt
+- `--image`: input image; required in `i2i` mode, optional for Wan TI2V/I2V auto-routing, and always required for Wan-Animate (character reference)
 - `--num-inference-steps`: number of denoising steps
 - `--warmup`: number of warmup runs before measurement
 - `--iterations`: number of measured iterations
@@ -130,6 +156,7 @@ uv run python benchmark.py \
 - `--save-json`: path for aggregate and per-iteration benchmark results
 - `--disable-compile`: disable `torch.compile`
 - `--compile-mode`: set the `torch.compile` mode
+- `--compile-dynamic`: pass `dynamic=True` to `torch.compile`
 
 ### Wan-Animate options
 
@@ -153,6 +180,8 @@ After execution, the script prints per-stage mean and max latency to the termina
 - The script currently assumes a single device at `cuda:0`.
 - It fails immediately if CUDA is not available.
 - `--image` is required in `i2i` mode and always required for Wan-Animate (character reference image).
+- Wan video models accept `--num-frames`; if the requested frame count is incompatible with the latent temporal shape, diffusers will round it to a valid `4N + 1` value internally.
 - `--pose-video` and `--face-video` are required for all Wan-Animate runs.
 - `--background-video` and `--mask-video` are additionally required when `--wan-mode replace` is used.
+- `--compile-dynamic` can reduce some shape-specialization recompiles, but Wan VAE cache/state guards may still recompile.
 - If `torch.compile` is slow or unstable in your environment, use `--disable-compile`.

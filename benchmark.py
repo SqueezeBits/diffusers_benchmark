@@ -16,7 +16,15 @@ import numpy as np
 import torch
 from PIL import Image
 
-from diffusers import Flux2KleinPipeline, Flux2Pipeline, FluxImg2ImgPipeline, FluxPipeline, WanAnimatePipeline
+from diffusers import (
+    Flux2KleinPipeline,
+    Flux2Pipeline,
+    FluxImg2ImgPipeline,
+    FluxPipeline,
+    WanAnimatePipeline,
+    WanImageToVideoPipeline,
+    WanPipeline,
+)
 from diffusers.utils import export_to_video, load_video
 
 
@@ -79,15 +87,22 @@ class MethodPatch:
         setattr(self.obj, self.name, self.original)
 
 
+def mark_cudagraph_step_begin() -> None:
+    compiler = getattr(torch, "compiler", None)
+    if compiler is not None and hasattr(compiler, "cudagraph_mark_step_begin"):
+        compiler.cudagraph_mark_step_begin()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Benchmark prompt embedding, denoising step, and latent decode for FLUX diffusers pipelines.",
+        description="Benchmark prompt embedding, denoising step, and latent decode for FLUX and Wan diffusers pipelines.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--model", required=True, help="Hugging Face model id.")
     parser.add_argument("--mode", choices=("t2i", "i2i"), default="t2i", help="Benchmark mode.")
     parser.add_argument("--prompt", default="A cat in a garden", help="Prompt text.")
-    parser.add_argument("--image", help="Init image path for i2i mode.")
+    parser.add_argument("--negative-prompt", help="Optional negative prompt text.")
+    parser.add_argument("--image", help="Init image path for i2i or Wan image-conditioned video runs.")
     parser.add_argument("--height", type=int, default=1024, help="Output height.")
     parser.add_argument("--width", type=int, default=1024, help="Output width.")
     parser.add_argument("--strength", type=float, default=0.6, help="Img2Img strength when supported by the pipeline.")
@@ -108,6 +123,11 @@ def parse_args() -> argparse.Namespace:
         help="torch.compile mode passed to compiled components.",
     )
     parser.add_argument(
+        "--compile-dynamic",
+        action="store_true",
+        help="Pass dynamic=True to torch.compile to reduce shape-specialization recompiles.",
+    )
+    parser.add_argument(
         "--save-json",
         help="Optional path to save aggregate and per-iteration benchmark results.",
     )
@@ -116,13 +136,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--face-video", help="Face video path for WanAnimate mode.")
     parser.add_argument("--background-video", help="Background video path for WanAnimate replace mode.")
     parser.add_argument("--mask-video", help="Mask video path for WanAnimate replace mode.")
-    parser.add_argument("--num-frames", type=int, default=77, help="segment_frame_length for WanAnimate.")
+    parser.add_argument("--num-frames", type=int, default=77, help="Frame count for Wan video pipelines.")
     parser.add_argument("--wan-mode", choices=("animate", "replace"), default="animate", help="WanAnimate pipeline mode.")
     parser.add_argument("--output-fps", type=int, default=30, help="FPS when saving video output.")
     args = parser.parse_args()
+    family = infer_model_family(args.model)
     if args.mode == "i2i" and not args.image:
         parser.error("--image is required when --mode i2i is selected.")
-    if infer_model_family(args.model) == "wan_animate":
+    if family == "wan_animate":
         if not args.image:
             raise ValueError("--image (character reference) is required for WanAnimate.")
         if not args.pose_video:
@@ -142,6 +163,8 @@ def infer_model_family(model_id: str) -> str:
         return "flux1"
     if "wan" in model_id_lower and "animate" in model_id_lower:
         return "wan_animate"
+    if "wan" in model_id_lower and any(tag in model_id_lower for tag in ("t2v", "i2v", "ti2v")):
+        return "wan_video"
     raise ValueError(f"Unsupported model family for: {model_id}")
 
 
@@ -149,6 +172,7 @@ def load_pipeline(
     model_id: str,
     mode: str,
     device: torch.device,
+    has_input_image: bool = False,
 ):
     family = infer_model_family(model_id)
     pipeline_cls = {
@@ -156,11 +180,12 @@ def load_pipeline(
         "flux2": Flux2Pipeline,
         "flux2_klein": Flux2KleinPipeline,
         "wan_animate": WanAnimatePipeline,
+        "wan_video": WanImageToVideoPipeline if has_input_image else WanPipeline,
     }[family]
 
     pipe = pipeline_cls.from_pretrained(model_id, torch_dtype=torch.bfloat16)
     pipe.to(device=device, dtype=torch.bfloat16)
-    pipe.set_progress_bar_config(disable=True)
+    pipe.set_progress_bar_config(disable=False)
     pipe._benchmark_pipeline_dtype = torch.bfloat16
     return pipe
 
@@ -178,12 +203,21 @@ def apply_compile(
     pipe: Any,
     enabled: bool,
     compile_mode: str,
+    compile_dynamic: bool,
 ) -> None:
     if not enabled:
         return
 
+    effective_compile_mode = compile_mode
+    if isinstance(pipe, (WanPipeline, WanImageToVideoPipeline, WanAnimatePipeline)) and compile_mode == "max-autotune":
+        effective_compile_mode = "max-autotune-no-cudagraphs"
+        print(
+            "Using compile mode max-autotune-no-cudagraphs for Wan pipelines "
+            "to avoid CUDA graph output reuse issues."
+        )
+
     def compile_method(fn: Any) -> Any:
-        return torch.compile(fn, mode=compile_mode, fullgraph=False)
+        return torch.compile(fn, mode=effective_compile_mode, fullgraph=False, dynamic=compile_dynamic)
 
     for attr_name in ("text_encoder", "text_encoder_2"):
         module = getattr(pipe, attr_name, None)
@@ -214,6 +248,7 @@ def instrument_pipeline(pipe: Any, stage_timer: StageTimer):
 
     def wrap_stage(name: str, fn: Any):
         def wrapped(*args, **kwargs):
+            mark_cudagraph_step_begin()
             with stage_timer.measure(name):
                 return fn(*args, **kwargs)
 
@@ -221,6 +256,7 @@ def instrument_pipeline(pipe: Any, stage_timer: StageTimer):
 
     def wrap_decode_start(fn: Any):
         def wrapped(*args, **kwargs):
+            mark_cudagraph_step_begin()
             stage_timer.start_span("decode_latent")
             return fn(*args, **kwargs)
 
@@ -242,22 +278,32 @@ def instrument_pipeline(pipe: Any, stage_timer: StageTimer):
     if hasattr(pipe.vae, "encode"):
         patches.append(MethodPatch(pipe.vae, "encode", wrap_stage("vae_encode", pipe.vae.encode)))
 
-    decode_start_method = None
-    if hasattr(pipe, "_unpack_latents_with_ids"):
-        decode_start_method = "_unpack_latents_with_ids"
-    elif hasattr(pipe, "_unpack_latents"):
-        decode_start_method = "_unpack_latents"
-
-    if decode_start_method is not None:
-        decode_start_fn = getattr(pipe, decode_start_method)
-        patches.append(MethodPatch(pipe, decode_start_method, wrap_decode_start(decode_start_fn)))
+    if hasattr(pipe.vae, "decode") and hasattr(getattr(pipe, "video_processor", None), "postprocess_video"):
+        patches.append(MethodPatch(pipe.vae, "decode", wrap_decode_start(pipe.vae.decode)))
         patches.append(
             MethodPatch(
-                pipe.image_processor,
-                "postprocess",
-                wrap_decode_end(pipe.image_processor.postprocess),
+                pipe.video_processor,
+                "postprocess_video",
+                wrap_decode_end(pipe.video_processor.postprocess_video),
             )
         )
+    else:
+        decode_start_method = None
+        if hasattr(pipe, "_unpack_latents_with_ids"):
+            decode_start_method = "_unpack_latents_with_ids"
+        elif hasattr(pipe, "_unpack_latents"):
+            decode_start_method = "_unpack_latents"
+
+        if decode_start_method is not None:
+            decode_start_fn = getattr(pipe, decode_start_method)
+            patches.append(MethodPatch(pipe, decode_start_method, wrap_decode_start(decode_start_fn)))
+            patches.append(
+                MethodPatch(
+                    pipe.image_processor,
+                    "postprocess",
+                    wrap_decode_end(pipe.image_processor.postprocess),
+                )
+            )
 
     try:
         yield
@@ -283,6 +329,8 @@ def build_call_kwargs(
         "guidance_scale": args.guidance_scale,
         "return_dict": False,
     }
+    if args.negative_prompt:
+        kwargs["negative_prompt"] = args.negative_prompt
 
     if args.mode == "i2i":
         signature = inspect.signature(pipe.__call__)
@@ -302,6 +350,11 @@ def build_call_kwargs(
             kwargs["background_video"] = background_video
         if mask_video is not None:
             kwargs["mask_video"] = mask_video
+    elif isinstance(pipe, WanImageToVideoPipeline):
+        kwargs["image"] = init_image
+        kwargs["num_frames"] = args.num_frames
+    elif isinstance(pipe, WanPipeline):
+        kwargs["num_frames"] = args.num_frames
 
     return kwargs
 
@@ -356,6 +409,10 @@ def save_output_video(output: Any, path: str, fps: int) -> None:
     frames = output
     if isinstance(frames, tuple):
         frames = frames[0]
+    if isinstance(frames, np.ndarray) and frames.ndim == 5:
+        frames = frames[0]
+    if isinstance(frames, list) and frames and isinstance(frames[0], list):
+        frames = frames[0]
     output_path = ensure_parent_dir(path)
     export_to_video(frames, str(output_path), fps=fps)
 
@@ -388,6 +445,7 @@ def run_once(
     call_kwargs["generator"] = make_generator(device=device, seed=seed)
     stage_timer.reset()
     stage_timer.synchronize()
+    mark_cudagraph_step_begin()
     start = time.perf_counter()
     output = pipe(**call_kwargs)
     stage_timer.synchronize()
@@ -436,6 +494,7 @@ def save_results(path: str, args: argparse.Namespace, pipe: Any, results: list[I
             "model": args.model,
             "mode": args.mode,
             "prompt": args.prompt,
+            "negative_prompt": args.negative_prompt,
             "height": args.height,
             "width": args.width,
             "strength": args.strength,
@@ -447,6 +506,7 @@ def save_results(path: str, args: argparse.Namespace, pipe: Any, results: list[I
             "pipeline_dtype": str(getattr(pipe, "_benchmark_pipeline_dtype", None)),
             "compile_enabled": not args.disable_compile,
             "compile_mode": args.compile_mode,
+            "compile_dynamic": args.compile_dynamic,
             "fullgraph": False,
         },
         "aggregate": {
@@ -480,14 +540,18 @@ def main() -> None:
         model_id=args.model,
         mode=args.mode,
         device=device,
+        has_input_image=bool(args.image),
     )
     apply_compile(
         pipe=pipe,
         enabled=not args.disable_compile,
         compile_mode=args.compile_mode,
+        compile_dynamic=args.compile_dynamic,
     )
 
     is_wan_animate = isinstance(pipe, WanAnimatePipeline)
+    is_wan_i2v = isinstance(pipe, WanImageToVideoPipeline)
+    is_video_pipeline = isinstance(pipe, (WanAnimatePipeline, WanImageToVideoPipeline, WanPipeline))
 
     if is_wan_animate:
         init_image = Image.open(args.image).convert("RGB")
@@ -495,6 +559,9 @@ def main() -> None:
         face_video_frames = load_video_frames(args.face_video)
         background_video_frames = load_video_frames(args.background_video) if args.background_video else None
         mask_video_frames = load_video_frames(args.mask_video) if args.mask_video else None
+    elif is_wan_i2v:
+        init_image = load_input_image(args.image, args.width, args.height)
+        pose_video_frames = face_video_frames = background_video_frames = mask_video_frames = None
     else:
         init_image = load_input_image(args.image, args.width, args.height) if args.mode == "i2i" else None
         pose_video_frames = face_video_frames = background_video_frames = mask_video_frames = None
@@ -539,7 +606,7 @@ def main() -> None:
         print(f"Saved benchmark json to: {args.save_json}")
 
     if args.output:
-        if is_wan_animate:
+        if is_video_pipeline:
             save_output_video(measured_runs[-1][1], args.output, fps=args.output_fps)
             print(f"Saved last iteration video to: {args.output}")
         else:
