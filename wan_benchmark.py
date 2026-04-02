@@ -387,6 +387,14 @@ def main() -> None:
     results = run_benchmark(names, args.steps, out, args.compile_mode)
     print_summary(results, args.steps)
 
+    # Save JSON results
+    import json
+
+    json_path = out / "results.json"
+    json_data = [asdict(r) for r in results]
+    json_path.write_text(json.dumps(json_data, indent=2))
+    print(f"\nResults saved to {json_path}")
+
 
 if __name__ == "__main__":
     main()
