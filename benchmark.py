@@ -175,7 +175,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--compile-mode",
-        default="max-autotune",
+        default="max-autotune-no-cudagraphs",
         help="torch.compile mode passed to compiled components.",
     )
     parser.add_argument(
