@@ -16,7 +16,8 @@ import numpy as np
 import torch
 from PIL import Image
 
-from diffusers import Flux2KleinPipeline, Flux2Pipeline, FluxImg2ImgPipeline, FluxPipeline
+from diffusers import Flux2KleinPipeline, Flux2Pipeline, FluxImg2ImgPipeline, FluxPipeline, WanAnimatePipeline
+from diffusers.utils import export_to_video, load_video
 
 
 @dataclass
@@ -110,9 +111,24 @@ def parse_args() -> argparse.Namespace:
         "--save-json",
         help="Optional path to save aggregate and per-iteration benchmark results.",
     )
+    # Wan arguments
+    parser.add_argument("--pose-video", help="Pose video path for WanAnimate mode.")
+    parser.add_argument("--face-video", help="Face video path for WanAnimate mode.")
+    parser.add_argument("--background-video", help="Background video path for WanAnimate replace mode.")
+    parser.add_argument("--mask-video", help="Mask video path for WanAnimate replace mode.")
+    parser.add_argument("--num-frames", type=int, default=77, help="segment_frame_length for WanAnimate.")
+    parser.add_argument("--wan-mode", choices=("animate", "replace"), default="animate", help="WanAnimate pipeline mode.")
+    parser.add_argument("--output-fps", type=int, default=30, help="FPS when saving video output.")
     args = parser.parse_args()
     if args.mode == "i2i" and not args.image:
         parser.error("--image is required when --mode i2i is selected.")
+    if infer_model_family(args.model) == "wan_animate":
+        if not args.image:
+            raise ValueError("--image (character reference) is required for WanAnimate.")
+        if not args.pose_video:
+            raise ValueError("--pose-video is required for WanAnimate.")
+        if not args.face_video:
+            raise ValueError("--face-video is required for WanAnimate.")
     return args
 
 
@@ -124,6 +140,8 @@ def infer_model_family(model_id: str) -> str:
         return "flux2"
     if "flux.1" in model_id_lower:
         return "flux1"
+    if "wan" in model_id_lower and "animate" in model_id_lower:
+        return "wan_animate"
     raise ValueError(f"Unsupported model family for: {model_id}")
 
 
@@ -137,6 +155,7 @@ def load_pipeline(
         "flux1": FluxPipeline if mode == "t2i" else FluxImg2ImgPipeline,
         "flux2": Flux2Pipeline,
         "flux2_klein": Flux2KleinPipeline,
+        "wan_animate": WanAnimatePipeline,
     }[family]
 
     pipe = pipeline_cls.from_pretrained(model_id, torch_dtype=torch.bfloat16)
@@ -149,6 +168,10 @@ def load_pipeline(
 def load_input_image(path: str, width: int, height: int) -> Image.Image:
     image = Image.open(path).convert("RGB")
     return image.resize((width, height))
+
+
+def load_video_frames(path: str) -> list[Image.Image]:
+    return load_video(path)
 
 
 def apply_compile(
@@ -179,6 +202,10 @@ def apply_compile(
         if hasattr(pipe.vae, "decode"):
             print("Compiling vae.decode...")
             pipe.vae.decode = compile_method(pipe.vae.decode)
+    
+    if getattr(pipe, "image_encoder", None) is not None:
+        print("Compiling image_encoder...")
+        pipe.image_encoder.forward = compile_method(pipe.image_encoder.forward)
 
 
 @contextmanager
@@ -243,6 +270,10 @@ def build_call_kwargs(
     pipe: Any,
     args: argparse.Namespace,
     init_image: Image.Image | None,
+    pose_video: list | None = None,
+    face_video: list | None = None,
+    background_video: list | None = None,
+    mask_video: list | None = None,
 ) -> dict[str, Any]:
     kwargs: dict[str, Any] = {
         "prompt": args.prompt,
@@ -258,6 +289,19 @@ def build_call_kwargs(
         kwargs["image"] = init_image
         if "strength" in signature.parameters:
             kwargs["strength"] = args.strength
+
+    if isinstance(pipe, WanAnimatePipeline):
+        kwargs.update({
+            "image": init_image,
+            "pose_video": pose_video,
+            "face_video": face_video,
+            "segment_frame_length": args.num_frames,
+            "mode": args.wan_mode,
+        })
+        if background_video is not None:
+            kwargs["background_video"] = background_video
+        if mask_video is not None:
+            kwargs["mask_video"] = mask_video
 
     return kwargs
 
@@ -306,6 +350,14 @@ def extract_first_image(output: Any) -> Image.Image | np.ndarray:
             raise ValueError("Pipeline returned an empty image list.")
         image = image[0]
     return image
+
+
+def save_output_video(output: Any, path: str, fps: int) -> None:
+    frames = output
+    if isinstance(frames, tuple):
+        frames = frames[0]
+    output_path = ensure_parent_dir(path)
+    export_to_video(frames, str(output_path), fps=fps)
 
 
 def save_output_image(output: Any, path: str) -> None:
@@ -435,8 +487,27 @@ def main() -> None:
         compile_mode=args.compile_mode,
     )
 
-    init_image = load_input_image(args.image, args.width, args.height) if args.mode == "i2i" else None
-    call_kwargs = build_call_kwargs(pipe=pipe, args=args, init_image=init_image)
+    is_wan_animate = isinstance(pipe, WanAnimatePipeline)
+
+    if is_wan_animate:
+        init_image = Image.open(args.image).convert("RGB")
+        pose_video_frames = load_video_frames(args.pose_video)
+        face_video_frames = load_video_frames(args.face_video)
+        background_video_frames = load_video_frames(args.background_video) if args.background_video else None
+        mask_video_frames = load_video_frames(args.mask_video) if args.mask_video else None
+    else:
+        init_image = load_input_image(args.image, args.width, args.height) if args.mode == "i2i" else None
+        pose_video_frames = face_video_frames = background_video_frames = mask_video_frames = None
+
+    call_kwargs = build_call_kwargs(
+        pipe=pipe,
+        args=args,
+        init_image=init_image,
+        pose_video=pose_video_frames,
+        face_video=face_video_frames,
+        background_video=background_video_frames,
+        mask_video=mask_video_frames,
+    )
     stage_timer = StageTimer(device=device)
 
     with instrument_pipeline(pipe=pipe, stage_timer=stage_timer):
@@ -468,8 +539,12 @@ def main() -> None:
         print(f"Saved benchmark json to: {args.save_json}")
 
     if args.output:
-        save_output_image(measured_runs[-1][1], args.output)
-        print(f"Saved last iteration image to: {args.output}")
+        if is_wan_animate:
+            save_output_video(measured_runs[-1][1], args.output, fps=args.output_fps)
+            print(f"Saved last iteration video to: {args.output}")
+        else:
+            save_output_image(measured_runs[-1][1], args.output)
+            print(f"Saved last iteration image to: {args.output}")
 
 
 if __name__ == "__main__":
