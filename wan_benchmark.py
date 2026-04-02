@@ -200,6 +200,11 @@ def run_benchmark(
         _orig_transformer_fwd = pipe.transformer.forward
         _orig_vae_decode = pipe.vae.decode
         _orig_vae_encode = getattr(pipe.vae, "encode", None)
+        _orig_transformer2_fwd = (
+            pipe.transformer_2.forward
+            if getattr(pipe, "transformer_2", None) is not None
+            else None
+        )
 
         def _timed_encode_prompt(*a, **kw):
             with timer.measure("text_encoder"):
@@ -208,6 +213,10 @@ def run_benchmark(
         def _timed_transformer(*a, **kw):
             with timer.measure("transformer"):
                 return _orig_transformer_fwd(*a, **kw)
+
+        def _timed_transformer2(*a, **kw):
+            with timer.measure("transformer_2"):
+                return _orig_transformer2_fwd(*a, **kw)
 
         def _timed_vae_decode(*a, **kw):
             with timer.measure("vae_decode"):
@@ -219,6 +228,8 @@ def run_benchmark(
 
         pipe.encode_prompt = _timed_encode_prompt
         pipe.transformer.forward = _timed_transformer
+        if _orig_transformer2_fwd is not None:
+            pipe.transformer_2.forward = _timed_transformer2
         pipe.vae.decode = _timed_vae_decode
         if _orig_vae_encode is not None:
             pipe.vae.encode = _timed_vae_encode
@@ -332,53 +343,19 @@ def print_summary(results: list[TimingResult], steps: int) -> None:
     for model_name in model_names:
         model_results = [r for r in results if r.model == model_name]
         for r in model_results:
-            # Collect all component names across results
-            comp_names = sorted(
-                {k for mr in model_results for k in mr.components}
-            )
-
-            print(f"\n==================== PROFILING REPORT ==")
-            print(f"  {gpu} | {model_name} | {r.label} | {steps} steps")
-            print(f"  torch.compile (max-autotune-no-cudagraphs, dynamic=True)")
-
-            # Component timings (calls from timer samples)
-            print(f"\nComponent Timings:")
-            hdr = f"{'components':<30} {'calls':>7} {'total':>12} {'avg':>12} (ms)"
+            print(f"\nBenchmark results (ms) — {model_name} / {r.label}")
+            print(f"  {gpu} | {steps} steps")
+            hdr = f"{'stage':<25} {'count':>8} {'mean':>12} {'total':>12}"
             print(hdr)
+            print("-" * len(hdr))
+            print(f"{'total':<25} {'1':>8} {r.e2e_ms:>12.1f} {r.e2e_ms:>12.1f}")
+            comp_names = sorted(r.components.keys())
             for comp in comp_names:
-                calls, ms = r.components.get(comp, (0, 0))
+                calls, ms = r.components[comp]
                 avg = ms / calls if calls else 0
-                print(f"{comp:<30} {calls:>7} {ms:>12.3f} {avg:>12.3f}")
-
-            # Method timings
-            print(f"\nMethod Timings:")
-            hdr = f"{'methods':<30} {'calls':>7} {'total':>12} {'avg':>12} (ms)"
-            print(hdr)
-            print(f"{'E2E execute':<30} {'1':>7} {r.e2e_ms:>12.3f} {r.e2e_ms:>12.3f}")
-            for comp in comp_names:
-                calls, ms = r.components.get(comp, (0, 0))
-                avg = ms / calls if calls else 0
-                print(f"{comp:<30} {calls:>7} {ms:>12.3f} {avg:>12.3f}")
-            print(f"{'warmup':<30} {'1':>7} {r.warmup_ms:>12.3f} {r.warmup_ms:>12.3f}")
-            print(f"==========================================")
-
-    # Summary table
-    print(f"\n{'=' * 65}")
-    print(f"  Summary — {gpu}, {steps} steps")
-    print(f"{'=' * 65}\n")
-
-    hdr = f"{'Model':<22} {'Resolution':<12} {'E2E (ms)':>10}"
-    print(hdr)
-    print("-" * len(hdr))
-
-    for model_name in model_names:
-        model_results = [r for r in results if r.model == model_name]
-        for r in model_results:
-            print(f"{r.model:<22} {r.label:<12} {r.e2e_ms:>10.0f}")
-        if len(model_results) > 1:
-            avg = mean(r.e2e_ms for r in model_results)
-            print(f"{model_name:<22} {'avg':<12} {avg:>10.0f}")
-        print()
+                print(f"{comp:<25} {calls:>8} {avg:>12.1f} {ms:>12.1f}")
+            print(f"{'warmup':<25} {'1':>8} {r.warmup_ms:>12.1f} {r.warmup_ms:>12.1f}")
+            print()
 
     # Save JSON
     json_data = [asdict(r) for r in results]
