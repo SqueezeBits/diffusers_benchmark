@@ -45,14 +45,17 @@ class IterationMetrics:
 
 
 class StageTimer:
-    def __init__(self, device: torch.device) -> None:
+    def __init__(self, device: torch.device, *, use_nvtx: bool = False) -> None:
         self.device = device
+        self.use_nvtx = use_nvtx
         self.samples: dict[str, list[float]] = defaultdict(list)
         self._span_starts: dict[str, float] = {}
+        self._active_nvtx_ranges: dict[str, bool] = {}
 
     def reset(self) -> None:
         self.samples.clear()
         self._span_starts.clear()
+        self._active_nvtx_ranges.clear()
 
     def synchronize(self) -> None:
         if self.device.type == "cuda":
@@ -60,6 +63,8 @@ class StageTimer:
 
     @contextmanager
     def measure(self, name: str):
+        if self.use_nvtx and self.device.type == "cuda":
+            torch.cuda.nvtx.range_push(name)
         self.synchronize()
         start = time.perf_counter()
         try:
@@ -67,8 +72,13 @@ class StageTimer:
         finally:
             self.synchronize()
             self.samples[name].append((time.perf_counter() - start) * 1000.0)
+            if self.use_nvtx and self.device.type == "cuda":
+                torch.cuda.nvtx.range_pop()
 
     def start_span(self, name: str) -> None:
+        if self.use_nvtx and self.device.type == "cuda":
+            torch.cuda.nvtx.range_push(name)
+            self._active_nvtx_ranges[name] = True
         self.synchronize()
         self._span_starts[name] = time.perf_counter()
 
@@ -78,6 +88,8 @@ class StageTimer:
             return
         self.synchronize()
         self.samples[name].append((time.perf_counter() - start) * 1000.0)
+        if self.use_nvtx and self.device.type == "cuda" and self._active_nvtx_ranges.pop(name, False):
+            torch.cuda.nvtx.range_pop()
 
 
 class MethodPatch:
@@ -129,6 +141,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--save-json",
         help="Optional path to save aggregate and per-iteration benchmark results.",
+    )
+    parser.add_argument(
+        "--nsys",
+        action="store_true",
+        help=(
+            "Enable NVTX annotations and cudaProfilerStart/Stop around measured iterations. "
+            "Launch with: nsys profile --capture-range=cudaProfilerApi "
+            "--capture-range-end=stop -o profile.nsys-rep python benchmark.py --nsys ..."
+        ),
     )
     args = parser.parse_args()
     if args.mode == "i2i" and not args.image:
@@ -427,21 +448,45 @@ def save_output_image(output: Any, path: str) -> None:
     raise TypeError(f"Unsupported image output type: {type(image)}")
 
 
+@contextmanager
+def maybe_nsys_capture(enabled: bool, label: str = "measured_runs"):
+    if not enabled:
+        yield
+        return
+
+    print(f"[nsys] capture range start: {label}")
+    torch.cuda.cudart().cudaProfilerStart()
+    torch.cuda.nvtx.range_push(label)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.cudart().cudaProfilerStop()
+        print(f"[nsys] capture range stop: {label}")
+
+
 def run_once(
     pipe: Any,
     base_call_kwargs: dict[str, Any],
     stage_timer: StageTimer,
     device: torch.device,
     seed: int,
+    iteration_label: str | None = None,
 ) -> tuple[IterationMetrics, Any]:
     call_kwargs = dict(base_call_kwargs)
     call_kwargs["generator"] = make_generator(device=device, seed=seed)
     stage_timer.reset()
     stage_timer.synchronize()
+    if iteration_label is not None and device.type == "cuda":
+        torch.cuda.nvtx.range_push(iteration_label)
     start = time.perf_counter()
-    output = pipe(**call_kwargs)
-    stage_timer.synchronize()
-    total_ms = (time.perf_counter() - start) * 1000.0
+    try:
+        output = pipe(**call_kwargs)
+        stage_timer.synchronize()
+        total_ms = (time.perf_counter() - start) * 1000.0
+    finally:
+        if iteration_label is not None and device.type == "cuda":
+            torch.cuda.nvtx.range_pop()
     return collect_iteration_metrics(stage_timer=stage_timer, total_ms=total_ms), output
 
 
@@ -517,6 +562,7 @@ def save_results(path: str, args: argparse.Namespace, pipe: Any, results: list[I
             "fp8_linear_replacements": getattr(
                 pipe, "_benchmark_fp8_linear_replacements", 0
             ),
+            "nsys_enabled": args.nsys,
         },
         "aggregate": {
             "total_ms": summarize([result.total_ms for result in results]),
@@ -545,6 +591,20 @@ def main() -> None:
         raise RuntimeError("This benchmark assumes a single CUDA device, but CUDA is not available.")
     torch.cuda.set_device(0)
 
+    if args.nsys:
+        print(
+            "\n[nsys] NVTX annotations enabled. Suggested launch command:\n"
+            "  nsys profile \\\
+"
+            "    --capture-range=cudaProfilerApi --capture-range-end=stop \\\
+"
+            "    --trace=cuda,nvtx,cudnn,cublas \\\
+"
+            "    -o profile.nsys-rep \\\
+"
+            "    python benchmark.py --nsys --model ...\n"
+        )
+
     pipe = load_pipeline(
         model_id=args.model,
         base_model=args.base_model,
@@ -559,7 +619,7 @@ def main() -> None:
 
     init_image = load_input_image(args.image, args.width, args.height) if args.mode == "i2i" else None
     call_kwargs = build_call_kwargs(pipe=pipe, args=args, init_image=init_image)
-    stage_timer = StageTimer(device=device)
+    stage_timer = StageTimer(device=device, use_nvtx=args.nsys)
 
     with instrument_pipeline(pipe=pipe, stage_timer=stage_timer):
         for _ in range(args.warmup):
@@ -571,16 +631,18 @@ def main() -> None:
                 seed=args.seed,
             )
 
-        measured_runs = [
-            run_once(
-                pipe=pipe,
-                base_call_kwargs=call_kwargs,
-                stage_timer=stage_timer,
-                device=device,
-                seed=args.seed,
-            )
-            for _ in range(args.iterations)
-        ]
+        with maybe_nsys_capture(args.nsys):
+            measured_runs = [
+                run_once(
+                    pipe=pipe,
+                    base_call_kwargs=call_kwargs,
+                    stage_timer=stage_timer,
+                    device=device,
+                    seed=args.seed,
+                    iteration_label=f"iteration_{index}",
+                )
+                for index in range(args.iterations)
+            ]
 
     results = [metrics for metrics, _ in measured_runs]
     print_summary(results)

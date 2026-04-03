@@ -119,6 +119,25 @@ uv run python benchmark.py \
 
 The official `FLUX.2-klein-4b-fp8` repo contains only DiT weights, so the benchmark automatically uses `black-forest-labs/FLUX.2-klein-4B` as the bf16 base pipeline. If you use a different DiT-only fp8 repo, pass the matching full pipeline with `--base-model`.
 
+### nsys profiling
+
+```bash
+nsys profile \
+  --capture-range=cudaProfilerApi --capture-range-end=stop \
+  --trace=cuda,nvtx,cudnn,cublas \
+  -o outputs/flux2-klein-fp8.nsys-rep \
+  uv run python benchmark.py \
+  --nsys \
+  --model "black-forest-labs/FLUX.2-klein-4b-fp8" \
+  --mode t2i \
+  --prompt "A cat in a garden" \
+  --num-inference-steps 4 \
+  --warmup 2 \
+  --iterations 1
+```
+
+`--nsys` adds NVTX ranges for benchmark stages and calls `cudaProfilerStart/Stop` only around measured iterations, so warmup runs stay outside the captured range.
+
 ## Main Options
 
 - `--model`: Hugging Face model ID
@@ -133,6 +152,7 @@ The official `FLUX.2-klein-4b-fp8` repo contains only DiT weights, so the benchm
 - `--save-json`: path for aggregate and per-iteration benchmark results
 - `--disable-compile`: disable `torch.compile`
 - `--compile-mode`: set the `torch.compile` mode
+- `--nsys`: add NVTX ranges and `cudaProfilerStart/Stop` around measured iterations
 
 ## Output
 
